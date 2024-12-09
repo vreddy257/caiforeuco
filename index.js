@@ -1,80 +1,138 @@
-require('dotenv').config(); 
-const express = require('express');
-const { DirectLine } = require('botframework-directlinejs');
-const bodyParser = require('body-parser');
-const WebSocket = require('ws'); // Import WebSocket explicitly
+const path = require('path');
+const dotenv = require('dotenv');
+const restify = require('restify');
+const { startConversation, sendMessageToPVA, pollBotResponse, handleCardSubmission, conversationId, conversationStarted } = require('./bot');  // Correct import
 
-global.XMLHttpRequest = require('xhr2');
-global.WebSocket = WebSocket; // Set the global WebSocket
+dotenv.config({ path: path.join(__dirname, '.env') });
 
-const PORT = process.env.PORT || 3000;
-const app = express();
+const server = restify.createServer();
+server.use(restify.plugins.bodyParser());
 
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));
+const { CloudAdapter, ConfigurationServiceClientCredentialFactory, createBotFrameworkAuthenticationFromConfiguration } = require('botbuilder');
 
-const directLine = new DirectLine({
-    secret: process.env.DIRECT_LINE_SECRET // Replace with your Direct Line secret
+// Set up credentials
+const credentialsFactory = new ConfigurationServiceClientCredentialFactory({
+    MicrosoftAppId: process.env.MicrosoftAppId || "",
+    MicrosoftAppPassword: process.env.MicrosoftAppPassword || "",
+    MicrosoftAppType: process.env.MicrosoftAppType || "",
+    MicrosoftAppTenantId: process.env.MicrosoftAppTenantId || ""
 });
 
-// API route to handle messages from Bot Framework Emulator
-app.post('/api/messages', async (req, res) => {
-    directLine
-        .postActivity({
-            from: { id: 'myUserId', name: 'myUserName' }, // Required (from.name is optional)
-            type: 'message',
-            text: req.body.text
-        })
-        .subscribe(
-            id => {
-                console.log('Posted activity, assigned ID ', id);
-                res.status(200).send({ id });
-            },
-            error => {
-                console.log('Error posting activity', error);
-                res.status(500).send({ error: 'Failed to post message' });
+const botFrameworkAuthentication = createBotFrameworkAuthenticationFromConfiguration(null, credentialsFactory);
+const adapter = new CloudAdapter(botFrameworkAuthentication);
+
+// Error handler
+const onTurnErrorHandler = async (context, error) => {
+    console.error(`\n [onTurnError] unhandled error: ${error}`);
+    await context.sendActivity('The bot encountered an error or bug.');
+};
+
+adapter.onTurnError = onTurnErrorHandler;
+
+// Handle User Message and start conversation only once
+const handleUserMessage = async (context) => {
+    const userMessage = context.activity.text;
+    console.log('Bot received the message, waiting for response...');
+
+    try {
+        if (context.activity.channelId === 'emulator') {
+            if (!conversationStarted) {
+                console.log('Starting new conversation...');
+                await startConversation();  // Start conversation and set conversationId
             }
-        );
-});
 
-// Listen to activities sent from the bot and forward to Emulator
-directLine.activity$.subscribe(activity => {
-    console.log('Received activity', activity);
-    // Forward activity to the Bot Emulator
-    // Example: Replace this with your logic to send the activity to the Emulator
-    forwardToBotEmulator(activity);
-});
+            if (!userMessage || userMessage.trim() === '') {
+                await context.sendActivity('Please provide a valid message.');
+                return;
+            }
 
-// Function to forward activity to the Bot Emulator
-function forwardToBotEmulator(activity) {
-    // Here you need to implement the actual forwarding mechanism
-    // Example using WebSocket or an API call to your Bot Emulator
-    // This might be a WebSocket connection or a REST API call based on your Bot Emulator setup
-    console.log('Forwarding activity to Bot Emulator', activity);
-    // Example: 
-    // YourEmulator.sendActivity(activity);
+            const messageSentToPVA = await sendMessageToPVA(userMessage);
+            console.log(`Message sent to PVA: ${messageSentToPVA}`);
+
+            const botReply = await pollBotResponse();
+            console.log('Bot reply received:', botReply);
+
+            if (botReply && botReply.attachments && botReply.attachments.length > 0) {
+                console.log('Sending Adaptive Card to user...');
+                await context.sendActivity({
+                    type: 'message',
+                    attachments: botReply.attachments
+                });
+            } else {
+                await context.sendActivity(botReply || 'Sorry, I could not understand your request.');
+            }
+        } else {
+            await context.sendActivity('Messages are only processed from the Bot Framework Emulator.');
+        }
+    } catch (error) {
+        console.error('Error in bot communication:', error);
+        await context.sendActivity('Sorry, there was an issue communicating with the bot.');
+    }
+};
+
+
+// Handle submission of card information (e.g., from Adaptive Cards)
+const handleCardSubmissionMessage = async (context) => {
+    const userMessage = context.activity.value;
+    console.log('Card submission received:', userMessage);
+
+    try {
+        if (userMessage) {
+            // Process the submitted data (e.g., UserVal, PassVal, etc.)
+            console.log('Processing dynamic card submission:', userMessage);
+
+            // Send the submitted data to PVA
+            const messageSentToPVA = await sendMessageToPVA(userMessage);
+            console.log(`Message sent to PVA: ${messageSentToPVA}`);
+
+            // Wait for the bot's response after sending the card data to PVA
+            const botReply = await pollBotResponse();  // Poll for the response from PVA
+            console.log('Bot reply received:', botReply);
+
+            if (botReply && botReply.attachments && botReply.attachments.length > 0) {
+                // If the bot response contains an attachment (Adaptive Card), send it back to the user
+                console.log('Sending Adaptive Card to user...');
+                await context.sendActivity({
+                    type: 'message',
+                    attachments: botReply.attachments
+                });
+            } else {
+                // Otherwise, send the text response back to the user
+                await context.sendActivity(botReply || 'Sorry, I could not understand your request.');
+            }
+        } else {
+            await context.sendActivity('Invalid data received from the card submission.');
+        }
+    } catch (error) {
+        console.error('Error handling card submission:', error);
+        await context.sendActivity('There was an error processing your submission.');
+    }
+};
+
+
+
+// Bot class to handle messages
+class MyBot {
+    async onMessage(context) {
+        if (context.activity.value) {
+            // Handle card submission (if any)
+            await handleCardSubmissionMessage(context);
+        } else {
+            // Handle regular user message
+            await handleUserMessage(context);
+        }
+    }
 }
 
-// Use RxJS operators to filter message activities
-directLine.activity$
-  .filter(activity => activity.type === 'message')
-  .subscribe(message => console.log('Received message', message));
+const myBot = new MyBot();
 
-// Monitor connection status
-directLine.connectionStatus$.subscribe(connectionStatus => {
-    switch (connectionStatus) {
-        case 'Uninitialized':
-        case 'Connecting':
-        case 'Online':
-        case 'ExpiredToken':
-        case 'FailedToConnect':
-        case 'Ended':
-            console.log(`Connection Status: ${connectionStatus}`);
-            break;
-    }
+// API route to handle messages from Bot Framework Emulator
+server.post('/api/messages', async (req, res) => {
+    await adapter.process(req, res, (context) => myBot.onMessage(context));
 });
 
-app.listen(PORT, () => {
-    console.log(`Server listening at http://localhost:${PORT}`);
+// Start the server
+server.listen(process.env.port || process.env.PORT || 3978, () => {
+    console.log(`Server listening at ${server.url}`);
     console.log('Bot Framework Emulator: https://aka.ms/botframework-emulator');
 });
