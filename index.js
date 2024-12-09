@@ -7,7 +7,7 @@ const WebSocket = require('ws'); // Import WebSocket explicitly
 global.XMLHttpRequest = require('xhr2');
 global.WebSocket = WebSocket; // Set the global WebSocket
 
-const PORT = process.env.PORT || 3978;
+const PORT = process.env.PORT || 3000;
 const app = express();
 
 app.use(bodyParser.json());
